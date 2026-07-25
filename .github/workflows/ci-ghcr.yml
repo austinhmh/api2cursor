@@ -5,8 +5,7 @@ on:
     branches:
       - main
       - "feat/**"
-    tags:
-      - "v*"
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -14,20 +13,19 @@ permissions:
   packages: write
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/austinhmh/api2cursor
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/api2cursor
 
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - name: Install dependencies
         run: |
@@ -35,15 +33,17 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Run unit tests
-        run: python -m pytest -q
+      - name: Unit tests
+        run: |
+          PYTHONPATH=. pytest tests/ -v
+
+      - name: Import check
+        run: |
+          PYTHONPATH=. python -c "from app.compat.tools import parse_tool_definitions; from app.protocols import get_codec; print('ok')"
 
   image:
+    needs: verify
     runs-on: ubuntu-latest
-    needs: test
-    permissions:
-      contents: read
-      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,56 +51,61 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Generate image metadata
+      - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=sha,format=long,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=ref,event=tag
 
-      - name: Build and push
+      - name: Build image for verification
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
           load: true
+          push: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test image
+      - name: Smoke test container
         run: |
           set -euo pipefail
-          image_reference="${IMAGE_NAME}:sha-${GITHUB_SHA}"
-          container_name="api2cursor-smoke-${GITHUB_RUN_ID}"
-          trap 'docker rm -f "${container_name}" >/dev/null 2>&1 || true' EXIT
-          docker run -d --name "${container_name}" \
-            -e PROXY_TARGET_URL="https://example.com" \
-            -e PROXY_API_KEY="test" \
-            -e ACCESS_API_KEY="" \
-            -e DEBUG_MODE="off" \
-            -p 127.0.0.1:3029:3029 \
-            "${image_reference}"
+          IMAGE_REF="${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker run -d --name api2cursor-smoke \
+            -e PROXY_TARGET_URL=https://example.com \
+            -e PROXY_API_KEY=smoke-test \
+            -e ACCESS_API_KEY=smoke-access \
+            -e PROXY_PORT=3029 \
+            -p 127.0.0.1:13029:3029 \
+            "${IMAGE_REF}"
           for i in $(seq 1 30); do
-            if curl -fsS "http://127.0.0.1:3029/health" >/dev/null; then
-              echo "health ok"
-              exit 0
+            if curl -fsS "http://127.0.0.1:13029/health" >/tmp/a2c-health.json; then
+              cat /tmp/a2c-health.json
+              break
             fi
             sleep 2
           done
-          docker logs "${container_name}" || true
-          exit 1
+          curl -fsS "http://127.0.0.1:13029/health" | tee /tmp/a2c-health.json
+          # ApplyPatch schema synthesis smoke via python inside container
+          docker exec api2cursor-smoke python -c "from app.compat.tools import parse_tool_definitions, normalize_tools_in_place; tools=parse_tool_definitions([{'type':'custom','name':'ApplyPatch','description':'edit','format':{'type':'grammar','syntax':'lark','definition':'start: x'}}]); assert tools[0].parameters['properties']['input']['type']=='string'; payload={'tools':[{'type':'custom','name':'ApplyPatch','description':'edit','format':{'type':'grammar','syntax':'lark','definition':'start: x'}}]}; normalize_tools_in_place(payload, style='messages'); assert payload['tools'][0]['input_schema']['properties']['input']['type']=='string'; print('applypatch-compat-ok')"
+          docker rm -f api2cursor-smoke
+
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish verified image
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${IMAGE_NAME}:sha-${GITHUB_SHA}"
+          docker push "${IMAGE_REF}"
+          echo "Published ${IMAGE_REF}"

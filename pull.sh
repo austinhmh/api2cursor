@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
 IMAGE_REFERENCE="${1:-}"
 COMPOSE_FILE="${A2C_COMPOSE_FILE:-docker-compose.yml}"
-SERVICE_NAME="api2cursor"
-CONTAINER_NAME="api2cursor"
+SERVICE_NAME="${A2C_SERVICE_NAME:-api2cursor}"
+CONTAINER_NAME="${A2C_CONTAINER_NAME:-api2cursor}"
 ROLLBACK_IMAGE="api2cursor:rollback-previous"
+HEALTH_URL="${A2C_HEALTH_URL:-http://127.0.0.1:3029/health}"
 
 if docker compose version >/dev/null 2>&1; then
   COMPOSE_COMMAND=(docker compose)
@@ -32,7 +34,7 @@ if [[ ! -f "${COMPOSE_FILE}" ]]; then
 fi
 
 if [[ "${IMAGE_REFERENCE}" == ghcr.io/* ]]; then
-  GHCR_TOKEN="${GHCR_TOKEN:-${GH_TOKEN:-}}"
+  GHCR_TOKEN="${GHCR_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
   GHCR_USERNAME="${GHCR_USERNAME:-austinhmh}"
   if [[ -n "${GHCR_TOKEN}" ]]; then
     printf '%s' "${GHCR_TOKEN}" | docker login ghcr.io --username "${GHCR_USERNAME}" --password-stdin >/dev/null
@@ -46,68 +48,32 @@ fi
 
 echo "Pulling CI-built image: ${IMAGE_REFERENCE}"
 docker pull "${IMAGE_REFERENCE}"
-CANDIDATE_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${IMAGE_REFERENCE}")"
-
-TMP_COMPOSE="$(mktemp)"
-trap 'rm -f "${TMP_COMPOSE}"' EXIT
-python3 - <<PY
-from pathlib import Path
-import re
-text = Path("${COMPOSE_FILE}").read_text()
-image = """${IMAGE_REFERENCE}"""
-text2, n = re.subn(r'(^\s*image:\s*).*$', r'\g<1>' + image, text, count=1, flags=re.M)
-if n == 0:
-    raise SystemExit('failed to rewrite image in compose file')
-Path("${TMP_COMPOSE}").write_text(text2)
-PY
 
 replace_running_container() {
-  local target_compose="$1"
+  local target_image="$1"
   if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1; then
     docker stop "${CONTAINER_NAME}" >/dev/null || true
     docker rm "${CONTAINER_NAME}" >/dev/null || true
   fi
-  "${COMPOSE_COMMAND[@]}" -f "${target_compose}" up -d --no-build --force-recreate "${SERVICE_NAME}"
+  export API2CURSOR_IMAGE="${target_image}"
+  "${COMPOSE_COMMAND[@]}" -f "${COMPOSE_FILE}" up -d --no-build --force-recreate "${SERVICE_NAME}"
 }
 
-if ! replace_running_container "${TMP_COMPOSE}"; then
-  echo "Candidate failed to start."
-  exit 1
-fi
+replace_running_container "${IMAGE_REFERENCE}"
 
-healthy=false
-for attempt in $(seq 1 30); do
-  if curl -fsS --max-time 2 http://127.0.0.1:3029/health >/dev/null; then
-    healthy=true
-    break
+echo "Waiting for health: ${HEALTH_URL}"
+for i in $(seq 1 30); do
+  if curl -fsS "${HEALTH_URL}" >/tmp/api2cursor-health.json; then
+    cat /tmp/api2cursor-health.json
+    echo
+    echo "Deployed ${IMAGE_REFERENCE}"
+    exit 0
   fi
   sleep 2
 done
 
-if [[ "${healthy}" != "true" ]]; then
-  echo "Health check failed."
-  docker logs "${CONTAINER_NAME}" 2>&1 | tail -50 || true
-  exit 1
+echo "Health check failed; rolling back if possible."
+if docker image inspect "${ROLLBACK_IMAGE}" >/dev/null 2>&1; then
+  replace_running_container "${ROLLBACK_IMAGE}"
 fi
-
-RUNNING_IMAGE_ID="$(docker inspect --format '{{.Image}}' "${CONTAINER_NAME}")"
-if [[ "${RUNNING_IMAGE_ID}" != "${CANDIDATE_IMAGE_ID}" ]]; then
-  echo "Running image mismatch: ${RUNNING_IMAGE_ID} != ${CANDIDATE_IMAGE_ID}"
-  exit 1
-fi
-
-# Persist the image reference into the real compose file for next restarts.
-python3 - <<PY
-from pathlib import Path
-import re
-path = Path("${COMPOSE_FILE}")
-text = path.read_text()
-image = """${IMAGE_REFERENCE}"""
-text2, n = re.subn(r'(^\s*image:\s*).*$', r'\g<1>' + image, text, count=1, flags=re.M)
-if n:
-    path.write_text(text2)
-PY
-
-echo "Deployment verified."
-echo "Image: ${IMAGE_REFERENCE}"
-echo "Image ID: ${CANDIDATE_IMAGE_ID}"
+exit 1

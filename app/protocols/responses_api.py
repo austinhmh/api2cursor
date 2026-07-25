@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from ..compat.tools import dump_arguments, parse_tool_choice, parse_tool_definitions
+from ..compat.tools import dump_arguments, extract_custom_input, is_custom_origin_tool, parse_tool_choice, parse_tool_definitions
 from ..core.ir import (
     Block,
     IRMessage,
@@ -45,6 +45,13 @@ from .base import Codec, StreamDecoder, StreamEncoder, parse_json, sse_event, st
 class ResponsesCodec(Codec):
     format = 'responses'
 
+    def __init__(self) -> None:
+        self._custom_tool_names: set[str] = set()
+
+    def set_custom_tool_names(self, names: set[str] | None) -> None:
+        """由 pipeline 注入本轮 custom/ApplyPatch 工具名，用于回写 custom_tool_call。"""
+        self._custom_tool_names = set(names or set())
+
     # ═══════════════════════════════════════════
     #  客户端方向
     # ═══════════════════════════════════════════
@@ -65,6 +72,14 @@ class ResponsesCodec(Codec):
 
         request.tools = parse_tool_definitions(payload.get('tools'))
         request.tool_choice = parse_tool_choice(payload.get('tool_choice'))
+        self._custom_tool_names = {
+            t.name for t in request.tools
+            if t.origin in ('custom', 'apply_patch') or is_custom_origin_tool(t)
+        }
+        for message in request.messages:
+            for block in message.tool_calls():
+                if block.name in self._custom_tool_names:
+                    block.call_style = 'custom'
 
         if isinstance(payload.get('max_output_tokens'), int):
             request.max_tokens = payload['max_output_tokens']
@@ -83,7 +98,9 @@ class ResponsesCodec(Codec):
         if text:
             output.append(_message_item(gen_id('msg_'), text))
         for block in response.tool_calls():
-            output.append(_function_call_item(gen_id('fc_'), block.id, block.name, block.arguments))
+            if block.name in self._custom_tool_names:
+                block.call_style = 'custom'
+            output.append(_tool_call_output_item(gen_id('fc_'), block))
 
         return {
             'id': response.id or gen_id('resp_'),
@@ -96,7 +113,7 @@ class ResponsesCodec(Codec):
         }
 
     def stream_encoder(self, client_model: str) -> StreamEncoder:
-        return ResponsesStreamEncoder(client_model)
+        return ResponsesStreamEncoder(client_model, self._custom_tool_names)
 
     def error_event(self, message: str, error_type: str = 'upstream_error') -> str:
         return sse_event('error', {'type': 'error', 'error': {'type': error_type, 'message': message}})
@@ -118,15 +135,7 @@ class ResponsesCodec(Codec):
         if request.system:
             payload['instructions'] = request.system
         if request.tools:
-            payload['tools'] = [
-                {
-                    'type': 'function',
-                    'name': t.name,
-                    'description': t.description,
-                    'parameters': t.parameters,
-                }
-                for t in request.tools
-            ]
+            payload['tools'] = [_build_responses_tool(t) for t in request.tools]
         tool_choice = _build_tool_choice(request.tool_choice)
         if tool_choice is not None:
             payload['tool_choice'] = tool_choice
@@ -256,6 +265,7 @@ class ResponsesStreamDecoder(StreamDecoder):
                 id=tool['call_id'],
                 name=tool['name'],
                 arguments=tool['args'],
+                call_style=tool.get('call_style', 'function'),
             )
             for tool in self._tools.values()
         ]
@@ -279,18 +289,31 @@ class ResponsesStreamDecoder(StreamDecoder):
             call_id = item.get('call_id') or item.get('id') or gen_id('call_')
             name = item.get('name') or item.get('namespace') or 'custom_tool'
             initial_args = item.get('input', '') or ''
+            call_style = 'custom'
+            # freeform input 在 IR 中统一包装为 {"input": "..."} 以便跨协议传递
+            if initial_args and not str(initial_args).lstrip().startswith('{'):
+                initial_args = dump_arguments({'input': initial_args})
+            elif initial_args and isinstance(initial_args, str) and initial_args.lstrip().startswith('{'):
+                # 已是 JSON 则原样保留；否则仍包装
+                pass
+            else:
+                initial_args = dump_arguments({'input': initial_args}) if initial_args else dump_arguments({'input': ''})
         else:
             call_id = item.get('call_id') or item.get('id') or gen_id('call_')
             name = item.get('name', '')
             initial_args = item.get('arguments', '') or ''
+            call_style = 'function'
 
         self._tools[output_index] = {
             'index': our_index,
             'call_id': call_id,
             'name': name,
             'args': initial_args,
+            'call_style': call_style,
         }
-        events: list[StreamEvent] = [ToolCallStart(index=our_index, id=call_id, name=name)]
+        events: list[StreamEvent] = [
+            ToolCallStart(index=our_index, id=call_id, name=name, call_style=call_style),
+        ]
         if initial_args:
             events.append(ToolCallDelta(index=our_index, arguments=initial_args))
         return events
@@ -316,11 +339,18 @@ class ResponsesStreamDecoder(StreamDecoder):
             return []
         arguments = payload.get('arguments') or payload.get('input') or tool['args']
         name = payload.get('name') or tool['name']
+        if tool.get('call_style') == 'custom':
+            # 上游 custom_tool_call_input.done 的 input 是 freeform 字符串
+            if isinstance(arguments, str) and not arguments.lstrip().startswith('{'):
+                arguments = dump_arguments({'input': arguments})
+            elif not isinstance(arguments, str):
+                arguments = dump_arguments({'input': dump_arguments(arguments)})
         return [ToolCallEnd(
             index=tool['index'],
             id=tool['call_id'],
             name=name,
             arguments=arguments,
+            call_style=tool.get('call_style', 'function'),
         )]
 
     def _handle_completed(self, payload: dict[str, Any], *, incomplete: bool) -> list[StreamEvent]:
@@ -335,6 +365,7 @@ class ResponsesStreamDecoder(StreamDecoder):
                 id=tool['call_id'],
                 name=tool['name'],
                 arguments=tool['args'],
+                call_style=tool.get('call_style', 'function'),
             )
             for tool in self._tools.values()
         ]
@@ -372,7 +403,7 @@ class ResponsesStreamDecoder(StreamDecoder):
 
 @dataclass
 class _ToolItem:
-    """function_call 输出项的流式缓冲。"""
+    """function_call / custom_tool_call 输出项的流式缓冲。"""
 
     output_index: int
     fc_id: str
@@ -380,13 +411,15 @@ class _ToolItem:
     name: str
     args: str = ''
     closed: bool = False
+    call_style: str = 'function'
 
 
 class ResponsesStreamEncoder(StreamEncoder):
-    """维护 reasoning / message / function_call 输出项生命周期的状态机。"""
+    """维护 reasoning / message / function_call / custom_tool_call 输出项生命周期的状态机。"""
 
-    def __init__(self, client_model: str):
+    def __init__(self, client_model: str, custom_tool_names: set[str] | None = None):
         self._model = client_model
+        self._custom_tool_names: set[str] = set(custom_tool_names or set())
         self._resp_id = gen_id('resp_')
         self._created_at = int(time.time())
 
@@ -459,6 +492,11 @@ class ResponsesStreamEncoder(StreamEncoder):
             if tool is None or tool.closed:
                 return []
             tool.args += event.arguments
+            if tool.call_style == 'custom':
+                # 上游（如 Claude）给出的是 JSON 参数增量 {"input":"..."}；
+                # Cursor custom tool 需要 freeform input。增量无法可靠剥壳，
+                # 只缓冲，在 _close_tool 时一次性输出完整 input。
+                return []
             return [self._emit('response.function_call_arguments.delta', {
                 'type': 'response.function_call_arguments.delta',
                 'item_id': tool.fc_id,
@@ -469,10 +507,14 @@ class ResponsesStreamEncoder(StreamEncoder):
             tool = self._tools.get(event.index)
             if tool is None:
                 return []
+            if event.call_style == 'custom':
+                tool.call_style = 'custom'
             if event.arguments:
                 tool.args = event.arguments
             if event.name:
                 tool.name = event.name
+                if event.name in self._custom_tool_names or is_custom_origin_tool(name=event.name):
+                    tool.call_style = 'custom'
             return self._close_tool(tool)
         if isinstance(event, StreamEnd):
             return self._finish(event.finish_reason, event.usage)
@@ -571,24 +613,39 @@ class ResponsesStreamEncoder(StreamEncoder):
 
     def _start_tool(self, event: ToolCallStart) -> list[str]:
         out = self._close_reasoning() + self._close_text()
+        call_style = event.call_style or 'function'
+        if event.name in self._custom_tool_names or is_custom_origin_tool(name=event.name):
+            call_style = 'custom'
         tool = _ToolItem(
             output_index=self._alloc_index(),
             fc_id=gen_id('fc_'),
             call_id=event.id or gen_id('call_'),
             name=event.name,
+            call_style=call_style,
         )
         self._tools[event.index] = tool
-        out.append(self._emit('response.output_item.added', {
-            'type': 'response.output_item.added',
-            'output_index': tool.output_index,
-            'item': {
+        if call_style == 'custom':
+            item = {
+                'id': tool.fc_id,
+                'type': 'custom_tool_call',
+                'status': 'in_progress',
+                'call_id': tool.call_id,
+                'name': tool.name,
+                'input': '',
+            }
+        else:
+            item = {
                 'id': tool.fc_id,
                 'type': 'function_call',
                 'status': 'in_progress',
                 'call_id': tool.call_id,
                 'name': tool.name,
                 'arguments': '',
-            },
+            }
+        out.append(self._emit('response.output_item.added', {
+            'type': 'response.output_item.added',
+            'output_index': tool.output_index,
+            'item': item,
         }))
         return out
 
@@ -596,6 +653,30 @@ class ResponsesStreamEncoder(StreamEncoder):
         if tool.closed:
             return []
         tool.closed = True
+        if tool.call_style == 'custom':
+            input_text = extract_custom_input(tool.args)
+            item = {
+                'id': tool.fc_id,
+                'type': 'custom_tool_call',
+                'status': 'completed',
+                'call_id': tool.call_id or gen_id('call_'),
+                'name': tool.name,
+                'input': input_text,
+            }
+            self._output_items.append(item)
+            return [
+                self._emit('response.custom_tool_call_input.done', {
+                    'type': 'response.custom_tool_call_input.done',
+                    'item_id': tool.fc_id,
+                    'output_index': tool.output_index,
+                    'input': input_text,
+                }),
+                self._emit('response.output_item.done', {
+                    'type': 'response.output_item.done',
+                    'output_index': tool.output_index,
+                    'item': item,
+                }),
+            ]
         item = _function_call_item(tool.fc_id, tool.call_id, tool.name, tool.args)
         self._output_items.append(item)
         return [
@@ -669,23 +750,34 @@ def _parse_input_items(items: list[Any], messages: list[IRMessage]) -> None:
             pending_thinking = _extract_reasoning_text(item)
             continue
 
-        if item_type == 'function_call':
+        if item_type in ('function_call', 'custom_tool_call'):
             message = _last_assistant_or_new(messages)
             if pending_thinking and not message.has_thinking():
                 message.blocks.insert(0, ThinkingBlock(text=pending_thinking))
                 pending_thinking = None
+            if item_type == 'custom_tool_call':
+                raw_input = item.get('input', '')
+                arguments = dump_arguments({'input': raw_input if isinstance(raw_input, str) else dump_arguments(raw_input)})
+                call_style = 'custom'
+                name = item.get('name') or item.get('namespace') or 'custom_tool'
+            else:
+                arguments = dump_arguments(item.get('arguments', '{}'))
+                call_style = 'function'
+                name = item.get('name', '')
             message.blocks.append(ToolCallBlock(
                 id=item.get('call_id') or gen_id('call_'),
-                name=item.get('name', ''),
-                arguments=dump_arguments(item.get('arguments', '{}')),
+                name=name,
+                arguments=arguments,
+                call_style=call_style,
             ))
             continue
 
-        if item_type == 'function_call_output':
+        if item_type in ('function_call_output', 'custom_tool_call_output'):
             output = item.get('output', '')
             messages.append(IRMessage('user', [ToolResultBlock(
                 call_id=item.get('call_id', ''),
                 content=output if isinstance(output, str) else dump_arguments(output),
+                call_style='custom' if item_type == 'custom_tool_call_output' else 'function',
             )]))
             continue
 
@@ -760,22 +852,24 @@ def _append_input_items(message: IRMessage, items: list[dict[str, Any]]) -> None
             })
         for block in message.blocks:
             if isinstance(block, ToolCallBlock):
-                items.append({
-                    'type': 'function_call',
-                    'call_id': block.id or gen_id('call_'),
-                    'name': block.name,
-                    'arguments': block.arguments,
-                })
+                items.append(_tool_call_input_item(block))
         # thinking 块不回传：Responses 上游通过自身的 reasoning 项管理思考内容
         return
 
     for block in message.blocks:
         if isinstance(block, ToolResultBlock):
-            items.append({
-                'type': 'function_call_output',
-                'call_id': block.call_id,
-                'output': block.content,
-            })
+            if block.call_style == 'custom' or is_custom_origin_tool(name=block.name):
+                items.append({
+                    'type': 'custom_tool_call_output',
+                    'call_id': block.call_id,
+                    'output': block.content,
+                })
+            else:
+                items.append({
+                    'type': 'function_call_output',
+                    'call_id': block.call_id,
+                    'output': block.content,
+                })
 
     text_blocks = [b for b in message.blocks if isinstance(b, TextBlock)]
     image_blocks = [b for b in message.blocks if isinstance(b, ImageBlock)]
@@ -838,16 +932,84 @@ def _function_call_item(item_id: str, call_id: str, name: str, arguments: str) -
 
 def _parse_tool_call_item(item: dict[str, Any]) -> ToolCallBlock:
     if item.get('type') == 'custom_tool_call':
+        raw_input = item.get('input', '')
+        if not isinstance(raw_input, str):
+            raw_input = dump_arguments(raw_input)
         return ToolCallBlock(
             id=item.get('call_id') or item.get('id') or gen_id('call_'),
             name=item.get('name') or item.get('namespace') or 'custom_tool',
-            arguments=dump_arguments(item.get('input', '')),
+            arguments=dump_arguments({'input': raw_input}),
+            call_style='custom',
         )
     return ToolCallBlock(
         id=item.get('call_id') or item.get('id') or gen_id('call_'),
         name=item.get('name', ''),
         arguments=dump_arguments(item.get('arguments', '{}')),
+        call_style='function',
     )
+
+
+def _build_responses_tool(tool) -> dict[str, Any]:
+    """构建发往上游的 Responses tools 项。
+
+    Cursor 3.9+ 的 type=custom grammar 在 Claude / 多数代理上游不可用，
+    因此一律降级为 function + 单字段 input schema。回写 Cursor 时再还原为
+    custom_tool_call（见 _tool_call_output_item）。
+    """
+    parameters = tool.parameters
+    if not isinstance(parameters, dict) or not (parameters.get('properties') or {}):
+        # 兜底 freeform schema，避免空 properties
+        parameters = {
+            'type': 'object',
+            'properties': {
+                'input': {
+                    'type': 'string',
+                    'description': (
+                        'Full freeform tool input. For ApplyPatch, put the ENTIRE '
+                        'patch text starting with "*** Begin Patch".'
+                    ),
+                },
+            },
+            'required': ['input'],
+            'additionalProperties': False,
+        }
+    return {
+        'type': 'function',
+        'name': tool.name,
+        'description': tool.description,
+        'parameters': parameters,
+    }
+
+
+def _tool_call_output_item(item_id: str, block: ToolCallBlock) -> dict[str, Any]:
+    """把 IR 工具调用编码为 Responses output item（function_call 或 custom_tool_call）。"""
+    if block.call_style == 'custom' or is_custom_origin_tool(name=block.name):
+        return {
+            'id': item_id,
+            'type': 'custom_tool_call',
+            'status': 'completed',
+            'call_id': block.id or gen_id('call_'),
+            'name': block.name,
+            'input': extract_custom_input(block.arguments),
+        }
+    return _function_call_item(item_id, block.id, block.name, block.arguments)
+
+
+def _tool_call_input_item(block: ToolCallBlock) -> dict[str, Any]:
+    """把 IR 工具调用编码为 Responses input item（多轮回传）。"""
+    if block.call_style == 'custom' or is_custom_origin_tool(name=block.name):
+        return {
+            'type': 'custom_tool_call',
+            'call_id': block.id or gen_id('call_'),
+            'name': block.name,
+            'input': extract_custom_input(block.arguments),
+        }
+    return {
+        'type': 'function_call',
+        'call_id': block.id or gen_id('call_'),
+        'name': block.name,
+        'arguments': block.arguments,
+    }
 
 
 def _extract_reasoning_text(item: dict[str, Any]) -> str:

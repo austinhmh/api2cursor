@@ -30,7 +30,7 @@ from ..compat.thinking import (
     inject_thinking_into_messages_response,
     thinking_cache,
 )
-from ..compat.tools import fix_tool_call_block
+from ..compat.tools import custom_tool_names, fix_tool_call_block, is_custom_origin_tool, normalize_tools_in_place
 from ..protocols import get_codec
 from ..protocols.anthropic import parse_messages_usage
 from ..protocols.base import parse_json, sse_data, sse_event
@@ -38,7 +38,7 @@ from ..protocols.chat_completions import normalize_cc_request
 from ..protocols.responses_api import ensure_prompt_cache_key, parse_responses_usage
 from ..services import request_log
 from ..services.usage import usage_tracker
-from .ir import IRRequest, IRUsage, StreamEnd, StreamError, StreamEvent, ThinkingDelta
+from .ir import IRRequest, IRUsage, StreamEnd, StreamError, StreamEvent, ThinkingDelta, ToolCallEnd, ToolCallBlock
 from .routing import RouteDecision, resolve_route
 from .upstream import iter_sse, post_json, post_stream
 
@@ -190,9 +190,14 @@ async def _handle_non_stream(
         ir_response = upstream_codec.parse_response(data)
         if decision.upstream_format == 'chat':
             extract_think_from_response(ir_response)
+        custom_names = custom_tool_names(ir_request.tools) if ir_request else set()
         for block in ir_response.tool_calls():
-            fix_tool_call_block(block)
-        result = get_codec(decision.client_format).build_response(ir_response, decision.client_model)
+            fix_tool_call_block(block, custom_names)
+        # Responses 客户端需要知道哪些工具应回写为 custom_tool_call
+        client_codec = get_codec(decision.client_format)
+        if decision.client_format == 'responses' and hasattr(client_codec, 'set_custom_tool_names'):
+            client_codec.set_custom_tool_names(custom_names)
+        result = client_codec.build_response(ir_response, decision.client_model)
         usage = ir_response.usage
         reasoning = ir_response.thinking()
 
@@ -283,6 +288,9 @@ async def _convert_stream(
     """IR 转换流：上游 SSE → 解码 → 过滤器 → 编码 → 客户端 SSE。"""
     upstream_codec = get_codec(decision.upstream_format)
     client_codec = get_codec(decision.client_format)
+    custom_names = custom_tool_names(ir_request.tools) if ir_request else set()
+    if decision.client_format == 'responses' and hasattr(client_codec, 'set_custom_tool_names'):
+        client_codec.set_custom_tool_names(custom_names)
     decoder = upstream_codec.stream_decoder()
     encoder = client_codec.stream_encoder(decision.client_model)
     filters = [ThinkTagFilter()] if decision.upstream_format == 'chat' else []
@@ -314,6 +322,7 @@ async def _convert_stream(
                 request_log.append_upstream_event(turn, {'type': event_type, 'data': data})
                 events = _run_filters(filters, decoder.decode(event_type, data))
                 for event in events:
+                    event = _normalize_stream_tool_event(event)
                     track(event)
                     for message in encoder.encode(event):
                         client_count += 1
@@ -322,6 +331,7 @@ async def _convert_stream(
 
             tail = _run_filters(filters, decoder.finalize()) + _finalize_filters(filters)
             for event in tail:
+                event = _normalize_stream_tool_event(event)
                 track(event)
                 for message in encoder.encode(event):
                     client_count += 1
@@ -460,6 +470,9 @@ def _prepare_native_request(
 
     if parse_format == 'chat':
         normalize_cc_request(payload, decision.upstream_model)
+        # Cursor 3.9+ ApplyPatch 是 type=custom；上游 Claude/代理不支持 grammar，
+        # 必须在透传前合成 function schema，否则模型只能产出空 input。
+        normalize_tools_in_place(payload, style='chat')
         if instructions:
             _inject_instructions_chat(payload, instructions, position)
         payload['messages'] = thinking_cache.inject_cc(payload.get('messages') or [])
@@ -467,6 +480,7 @@ def _prepare_native_request(
 
     if parse_format == 'responses':
         sanitize_responses_payload(payload)
+        normalize_tools_in_place(payload, style='responses')
         if instructions:
             payload['instructions'] = _merge_text(
                 instructions, str(payload.get('instructions') or ''), position,
@@ -475,6 +489,7 @@ def _prepare_native_request(
         return payload
 
     # messages
+    normalize_tools_in_place(payload, style='messages')
     if instructions:
         existing = payload.get('system') or ''
         if isinstance(existing, list):
@@ -596,3 +611,29 @@ def _error_json(message: str, error_type: str, status: int) -> JSONResponse:
         {'error': {'message': message, 'type': error_type}},
         status_code=status,
     )
+
+
+def _normalize_stream_tool_event(event: StreamEvent) -> StreamEvent:
+    """流式工具事件：标记 custom 并统一 freeform 参数为 {"input": "..."}。"""
+    from .ir import ToolCallStart  # 局部导入避免循环
+
+    if isinstance(event, ToolCallStart):
+        if is_custom_origin_tool(name=event.name):
+            event.call_style = 'custom'
+        return event
+
+    if not isinstance(event, ToolCallEnd):
+        return event
+    block = ToolCallBlock(
+        id=event.id,
+        name=event.name,
+        arguments=event.arguments or '{}',
+        call_style='custom' if is_custom_origin_tool(name=event.name) else getattr(event, 'call_style', 'function'),
+    )
+    fix_tool_call_block(block)
+    event.arguments = block.arguments
+    event.name = block.name or event.name
+    if hasattr(event, 'call_style'):
+        event.call_style = block.call_style
+    return event
+

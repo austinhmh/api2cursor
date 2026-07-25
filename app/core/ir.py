@@ -55,7 +55,8 @@ class ThinkingBlock:
 class ToolCallBlock:
     id: str = ''
     name: str = ''
-    arguments: str = '{}'  # JSON 字符串
+    arguments: str = '{}'  # JSON 字符串；custom 工具统一为 {"input": "..."}
+    call_style: str = 'function'  # function / custom
 
 
 @dataclass
@@ -63,6 +64,7 @@ class ToolResultBlock:
     call_id: str = ''
     content: str = ''
     name: str = ''  # 工具名（Gemini functionResponse 等协议需要）
+    call_style: str = 'function'  # function / custom
 
 
 Block = Union[TextBlock, ImageBlock, ThinkingBlock, ToolCallBlock, ToolResultBlock]
@@ -94,6 +96,11 @@ class IRTool:
     name: str = ''
     description: str = ''
     parameters: dict[str, Any] = field(default_factory=dict)
+    # function: 普通 JSON Schema 工具
+    # custom: OpenAI/Cursor type=custom（grammar / freeform）
+    # apply_patch: OpenAI 内置 type=apply_patch
+    origin: str = 'function'
+    custom_format: dict[str, Any] | None = None
 
 
 @dataclass
@@ -166,6 +173,7 @@ class ToolCallStart:
     index: int = 0
     id: str = ''
     name: str = ''
+    call_style: str = 'function'  # function / custom
 
 
 @dataclass
@@ -182,6 +190,7 @@ class ToolCallEnd:
     id: str = ''
     name: str = ''
     arguments: str = ''
+    call_style: str = 'function'  # function / custom
 
 
 @dataclass

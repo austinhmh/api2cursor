@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..compat.tools import dump_arguments, parse_arguments_dict, parse_tool_choice, parse_tool_definitions
+from ..compat.tools import dump_arguments, is_custom_origin_tool, parse_arguments_dict, parse_tool_choice, parse_tool_definitions, repair_custom_tool_args
 from ..core.ir import (
     Block,
     IRMessage,
@@ -107,7 +107,11 @@ class AnthropicCodec(Codec):
                     'type': 'tool_use',
                     'id': block.id or gen_id('toolu_'),
                     'name': block.name,
-                    'input': parse_arguments_dict(block.arguments),
+                    'input': repair_custom_tool_args(
+                        block.name,
+                        parse_arguments_dict(block.arguments),
+                        call_style=block.call_style,
+                    ),
                 })
 
         return {
@@ -186,10 +190,16 @@ class AnthropicCodec(Codec):
                     signature=block.get('signature', ''),
                 ))
             elif block_type == 'tool_use':
+                name = block.get('name', '')
+                args = block.get('input', {})
+                if not isinstance(args, dict):
+                    args = parse_arguments_dict(args)
+                args = repair_custom_tool_args(name, args)
                 blocks.append(ToolCallBlock(
                     id=block.get('id') or gen_id('toolu_'),
-                    name=block.get('name', ''),
-                    arguments=dump_arguments(block.get('input', {})),
+                    name=name,
+                    arguments=dump_arguments(args),
+                    call_style='custom' if is_custom_origin_tool(name=name) else 'function',
                 ))
 
         return IRResponse(
@@ -591,10 +601,16 @@ def _parse_content_blocks(content: Any) -> list[Block]:
             elif isinstance(source, dict):
                 blocks.append(ImageBlock(url=source.get('url', '')))
         elif part_type == 'tool_use':
+            name = part.get('name', '')
+            args = part.get('input', {})
+            if not isinstance(args, dict):
+                args = parse_arguments_dict(args)
+            args = repair_custom_tool_args(name, args)
             blocks.append(ToolCallBlock(
                 id=part.get('id') or gen_id('toolu_'),
-                name=part.get('name', ''),
-                arguments=dump_arguments(part.get('input', {})),
+                name=name,
+                arguments=dump_arguments(args),
+                call_style='custom' if is_custom_origin_tool(name=name) else 'function',
             ))
         elif part_type == 'tool_result':
             blocks.append(ToolResultBlock(
@@ -651,7 +667,11 @@ def _build_content_blocks(message: IRMessage) -> list[dict[str, Any]]:
                 'type': 'tool_use',
                 'id': block.id or gen_id('toolu_'),
                 'name': block.name,
-                'input': parse_arguments_dict(block.arguments),
+                'input': repair_custom_tool_args(
+                    block.name,
+                    parse_arguments_dict(block.arguments),
+                    call_style=block.call_style,
+                ),
             })
         elif isinstance(block, ToolResultBlock):
             others.append({

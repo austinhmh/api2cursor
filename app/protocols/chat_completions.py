@@ -17,7 +17,7 @@ import json
 import time
 from typing import Any
 
-from ..compat.tools import dump_arguments, parse_tool_choice, parse_tool_definitions
+from ..compat.tools import dump_arguments, extract_custom_input, is_custom_origin_tool, parse_arguments_dict, parse_tool_choice, parse_tool_definitions, repair_custom_tool_args
 from ..core.ir import (
     Block,
     IRMessage,
@@ -86,12 +86,36 @@ class ChatCompletionsCodec(Codec):
                 for tool_call in message.get('tool_calls') or []:
                     if not isinstance(tool_call, dict):
                         continue
+                    if tool_call.get('type') == 'custom' or isinstance(tool_call.get('custom'), dict):
+                        custom = tool_call.get('custom') or {}
+                        name = custom.get('name', '')
+                        raw_input = custom.get('input', '')
+                        blocks.append(ToolCallBlock(
+                            id=tool_call.get('id') or gen_id('call_'),
+                            name=name,
+                            arguments=dump_arguments({'input': raw_input if isinstance(raw_input, str) else dump_arguments(raw_input)}),
+                            call_style='custom',
+                        ))
+                        continue
                     func = tool_call.get('function') or {}
-                    blocks.append(ToolCallBlock(
-                        id=tool_call.get('id') or gen_id('call_'),
-                        name=func.get('name', ''),
-                        arguments=dump_arguments(func.get('arguments', '{}')),
-                    ))
+                    name = func.get('name', '')
+                    arguments = dump_arguments(func.get('arguments', '{}'))
+                    if is_custom_origin_tool(name=name):
+                        args = parse_arguments_dict(arguments)
+                        args = repair_custom_tool_args(name, args, call_style='custom')
+                        arguments = dump_arguments(args)
+                        blocks.append(ToolCallBlock(
+                            id=tool_call.get('id') or gen_id('call_'),
+                            name=name,
+                            arguments=arguments,
+                            call_style='custom',
+                        ))
+                    else:
+                        blocks.append(ToolCallBlock(
+                            id=tool_call.get('id') or gen_id('call_'),
+                            name=name,
+                            arguments=arguments,
+                        ))
 
             if blocks:
                 request.messages.append(IRMessage(ir_role, blocks))
@@ -120,12 +144,7 @@ class ChatCompletionsCodec(Codec):
             message['reasoning_content'] = thinking
 
         tool_calls = [
-            {
-                'index': index,
-                'id': block.id or gen_id('call_'),
-                'type': 'function',
-                'function': {'name': block.name, 'arguments': block.arguments},
-            }
+            _build_cc_tool_call(index, block)
             for index, block in enumerate(response.tool_calls())
         ]
         if tool_calls:
@@ -568,23 +587,133 @@ def _normalize_cc_message(message: Any) -> list[Any]:
 
 
 def _normalize_tool_definition(tool: Any) -> Any:
+    """把 Cursor/OpenAI 各种工具定义收敛为 chat 上游可理解的 function tool。
+
+    type=custom / type=apply_patch 在非 OpenAI 上游没有原生语义，因此合成
+    parameters.input 字符串字段（与 IR 层 _CUSTOM_INPUT_SCHEMA 对齐）。
+    """
     if not isinstance(tool, dict):
         return tool
-    if tool.get('type') == 'function' and 'function' in tool:
+
+    tool_type = tool.get('type')
+    if tool_type == 'custom':
+        nested = tool.get('custom') if isinstance(tool.get('custom'), dict) else None
+        name = (nested or tool).get('name') or tool.get('name') or 'custom_tool'
+        description = (nested or tool).get('description') or tool.get('description') or ''
+        return {
+            'type': 'function',
+            'function': {
+                'name': name,
+                'description': description,
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'input': {
+                            'type': 'string',
+                            'description': 'Complete freeform tool input (for ApplyPatch: full patch text).',
+                        },
+                    },
+                    'required': ['input'],
+                    'additionalProperties': False,
+                },
+            },
+        }
+
+    if tool_type == 'apply_patch':
+        return {
+            'type': 'function',
+            'function': {
+                'name': 'ApplyPatch',
+                'description': 'Create/update/delete files via *** Begin Patch envelope.',
+                'parameters': {
+                    'type': 'object',
+                    'properties': {
+                        'input': {
+                            'type': 'string',
+                            'description': 'Complete freeform patch text.',
+                        },
+                    },
+                    'required': ['input'],
+                    'additionalProperties': False,
+                },
+            },
+        }
+
+    if tool_type == 'function' and 'function' in tool:
+        func = tool.get('function') or {}
+        name = func.get('name', '')
+        parameters = func.get('parameters') or {'type': 'object', 'properties': {}}
+        if is_custom_origin_tool(name=name) and (
+            not isinstance(parameters, dict)
+            or not (parameters.get('properties') or {})
+        ):
+            tool = dict(tool)
+            tool['function'] = dict(func)
+            tool['function']['parameters'] = {
+                'type': 'object',
+                'properties': {
+                    'input': {
+                        'type': 'string',
+                        'description': 'Complete freeform tool input (for ApplyPatch: full patch text).',
+                    },
+                },
+                'required': ['input'],
+                'additionalProperties': False,
+            }
         return tool
+
     if 'name' not in tool:
         return tool
+
+    name = tool.get('name', '')
+    parameters = (
+        tool.get('input_schema')
+        or tool.get('parameters')
+        or {'type': 'object', 'properties': {}}
+    )
+    if is_custom_origin_tool(name=name) and (
+        not isinstance(parameters, dict)
+        or not (parameters.get('properties') or {})
+    ):
+        parameters = {
+            'type': 'object',
+            'properties': {
+                'input': {
+                    'type': 'string',
+                    'description': 'Complete freeform tool input (for ApplyPatch: full patch text).',
+                },
+            },
+            'required': ['input'],
+            'additionalProperties': False,
+        }
     return {
         'type': 'function',
         'function': {
-            'name': tool.get('name', ''),
+            'name': name,
             'description': tool.get('description', ''),
-            'parameters': (
-                tool.get('input_schema')
-                or tool.get('parameters')
-                or {'type': 'object', 'properties': {}}
-            ),
+            'parameters': parameters,
         },
+    }
+
+
+def _build_cc_tool_call(index: int, block: ToolCallBlock) -> dict[str, Any]:
+    """编码 Chat Completions 风格 tool_call；custom 工具用 type=custom。"""
+    call_id = block.id or gen_id('call_')
+    if block.call_style == 'custom' or is_custom_origin_tool(name=block.name):
+        return {
+            'index': index,
+            'id': call_id,
+            'type': 'custom',
+            'custom': {
+                'name': block.name,
+                'input': extract_custom_input(block.arguments),
+            },
+        }
+    return {
+        'index': index,
+        'id': call_id,
+        'type': 'function',
+        'function': {'name': block.name, 'arguments': block.arguments},
     }
 
 

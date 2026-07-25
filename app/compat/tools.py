@@ -608,3 +608,215 @@ def repair_custom_tool_args(
             return args
     freeform = extract_freeform_input(args)
     return {'input': freeform}
+
+
+# ═══════════════════════════════════════════════════════════
+#  Responses raw 透传：function_call → custom_tool_call 回写
+# ═══════════════════════════════════════════════════════════
+
+
+def collect_custom_tool_names_from_payload(payload: dict[str, Any] | None) -> set[str]:
+    """从原始请求 payload 的 tools 字段提取 custom/ApplyPatch 工具名。"""
+    if not isinstance(payload, dict):
+        return set()
+    return custom_tool_names(parse_tool_definitions(payload.get('tools')))
+
+
+def rewrite_responses_item_for_custom_tools(
+    item: Any,
+    custom_names: set[str],
+) -> Any:
+    """把 output/input 中的 function_call 项还原为 custom_tool_call。"""
+    if not isinstance(item, dict) or not custom_names:
+        return item
+    item_type = item.get('type', '')
+    name = item.get('name') or ''
+    if item_type == 'function_call' and (name in custom_names or is_custom_origin_tool(name=name)):
+        freeform = extract_freeform_input(item.get('arguments', ''))
+        return {
+            'id': item.get('id') or '',
+            'type': 'custom_tool_call',
+            'status': item.get('status') or 'completed',
+            'call_id': item.get('call_id') or item.get('id') or '',
+            'name': name,
+            'input': freeform,
+        }
+    if item_type == 'function_call_output' and item.get('call_id'):
+        # 输出项本身无 name；若调用侧已是 custom，保持原样即可
+        return item
+    return item
+
+
+def rewrite_responses_payload_for_custom_tools(
+    payload: dict[str, Any],
+    custom_names: set[str],
+) -> dict[str, Any]:
+    """非流式 / completed 事件：重写 response.output 中的 function_call。"""
+    if not custom_names or not isinstance(payload, dict):
+        return payload
+
+    response_obj = payload.get('response')
+    if isinstance(response_obj, dict) and isinstance(response_obj.get('output'), list):
+        response_obj['output'] = [
+            rewrite_responses_item_for_custom_tools(item, custom_names)
+            for item in response_obj['output']
+        ]
+
+    if isinstance(payload.get('output'), list):
+        payload['output'] = [
+            rewrite_responses_item_for_custom_tools(item, custom_names)
+            for item in payload['output']
+        ]
+
+    # output_item.added / done 的 item 字段
+    item = payload.get('item')
+    if isinstance(item, dict):
+        payload['item'] = rewrite_responses_item_for_custom_tools(item, custom_names)
+
+    return payload
+
+
+class ResponsesCustomToolStreamRewriter:
+    """流式透传时把 ApplyPatch 等 custom 工具的 function_call 事件还原为 custom_tool_call。
+
+    上游（cliproxy / chat 中转）通常输出：
+      response.output_item.added  item.type=function_call
+      response.function_call_arguments.delta/done
+      response.output_item.done   item.type=function_call
+
+    Cursor 本地 ApplyPatch 执行器需要：
+      response.output_item.added  item.type=custom_tool_call, input=""
+      response.custom_tool_call_input.delta/done  input=freeform
+      response.output_item.done   item.type=custom_tool_call, input=freeform
+    """
+
+    def __init__(self, custom_names: set[str] | None = None):
+        self._custom_names = set(custom_names or set())
+        # call_id / item_id → 缓冲
+        self._buffers: dict[str, dict[str, Any]] = {}
+
+    def _is_custom_name(self, name: str) -> bool:
+        return bool(name) and (name in self._custom_names or is_custom_origin_tool(name=name))
+
+    def _key_for(self, payload: dict[str, Any], item: dict[str, Any] | None = None) -> str:
+        item = item or {}
+        return str(
+            payload.get('item_id')
+            or item.get('id')
+            or item.get('call_id')
+            or payload.get('call_id')
+            or payload.get('output_index')
+            or ''
+        )
+
+    def process(self, event_type: str, payload: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        """返回零或多条 (event_type, payload) 供下游发送。"""
+        if not self._custom_names:
+            return [(event_type, payload)]
+
+        etype = event_type or payload.get('type', '')
+        item = payload.get('item') if isinstance(payload.get('item'), dict) else None
+
+        # 1) output_item.added: function_call → custom_tool_call
+        if etype == 'response.output_item.added' and item:
+            name = item.get('name') or ''
+            if item.get('type') == 'function_call' and self._is_custom_name(name):
+                key = self._key_for(payload, item)
+                self._buffers[key] = {
+                    'name': name,
+                    'call_id': item.get('call_id') or '',
+                    'item_id': item.get('id') or '',
+                    'args': item.get('arguments') or '',
+                    'output_index': payload.get('output_index'),
+                }
+                new_item = {
+                    'id': item.get('id') or '',
+                    'type': 'custom_tool_call',
+                    'status': item.get('status') or 'in_progress',
+                    'call_id': item.get('call_id') or '',
+                    'name': name,
+                    'input': '',
+                }
+                new_payload = dict(payload)
+                new_payload['type'] = 'response.output_item.added'
+                new_payload['item'] = new_item
+                return [('response.output_item.added', new_payload)]
+            return [(etype, payload)]
+
+        # 2) function_call_arguments.delta
+        if etype == 'response.function_call_arguments.delta':
+            key = self._key_for(payload)
+            buf = self._buffers.get(key)
+            # 也尝试用 output_index 匹配
+            if buf is None:
+                for b in self._buffers.values():
+                    if b.get('output_index') == payload.get('output_index'):
+                        buf = b
+                        key = self._key_for({'item_id': b.get('item_id')})
+                        break
+            if buf is None:
+                # 未知是否 custom：原样透传
+                return [(etype, payload)]
+            delta = payload.get('delta') or ''
+            buf['args'] = (buf.get('args') or '') + delta
+            # 流式 JSON 增量无法可靠剥壳；缓冲到 done 再一次性输出 freeform
+            return []
+
+        # 3) function_call_arguments.done
+        if etype == 'response.function_call_arguments.done':
+            key = self._key_for(payload)
+            buf = self._buffers.get(key)
+            if buf is None:
+                for k, b in self._buffers.items():
+                    if b.get('output_index') == payload.get('output_index'):
+                        buf = b
+                        key = k
+                        break
+            if buf is None:
+                return [(etype, payload)]
+            args = payload.get('arguments')
+            if args is None:
+                args = buf.get('args') or ''
+            freeform = extract_freeform_input(args)
+            buf['args'] = args
+            buf['freeform'] = freeform
+            new_payload = {
+                'type': 'response.custom_tool_call_input.done',
+                'item_id': payload.get('item_id') or buf.get('item_id') or '',
+                'output_index': payload.get('output_index', buf.get('output_index')),
+                'input': freeform,
+            }
+            if 'sequence_number' in payload:
+                new_payload['sequence_number'] = payload['sequence_number']
+            return [('response.custom_tool_call_input.done', new_payload)]
+
+        # 4) output_item.done
+        if etype == 'response.output_item.done' and item:
+            name = item.get('name') or ''
+            if item.get('type') == 'function_call' and self._is_custom_name(name):
+                key = self._key_for(payload, item)
+                buf = self._buffers.get(key)
+                args = item.get('arguments') or (buf.get('args') if buf else '') or ''
+                freeform = (buf.get('freeform') if buf else None) or extract_freeform_input(args)
+                new_item = {
+                    'id': item.get('id') or '',
+                    'type': 'custom_tool_call',
+                    'status': item.get('status') or 'completed',
+                    'call_id': item.get('call_id') or '',
+                    'name': name,
+                    'input': freeform,
+                }
+                new_payload = dict(payload)
+                new_payload['type'] = 'response.output_item.done'
+                new_payload['item'] = new_item
+                return [('response.output_item.done', new_payload)]
+            return [(etype, payload)]
+
+        # 5) completed / incomplete：重写 output 数组
+        if etype in ('response.completed', 'response.incomplete', 'response.failed'):
+            rewrite_responses_payload_for_custom_tools(payload, self._custom_names)
+            return [(etype, payload)]
+
+        # 其它事件：若 payload 内嵌 item/output，也尝试重写
+        rewrite_responses_payload_for_custom_tools(payload, self._custom_names)
+        return [(etype, payload)]

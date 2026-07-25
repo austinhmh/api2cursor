@@ -30,7 +30,15 @@ from ..compat.thinking import (
     inject_thinking_into_messages_response,
     thinking_cache,
 )
-from ..compat.tools import custom_tool_names, fix_tool_call_block, is_custom_origin_tool, normalize_tools_in_place
+from ..compat.tools import (
+    ResponsesCustomToolStreamRewriter,
+    collect_custom_tool_names_from_payload,
+    custom_tool_names,
+    fix_tool_call_block,
+    is_custom_origin_tool,
+    normalize_tools_in_place,
+    rewrite_responses_payload_for_custom_tools,
+)
 from ..protocols import get_codec
 from ..protocols.anthropic import parse_messages_usage
 from ..protocols.base import parse_json, sse_data, sse_event
@@ -184,7 +192,8 @@ async def _handle_non_stream(
 
     reasoning = ''
     if raw_response:
-        result, usage = _finalize_raw_response(decision, data)
+        custom_names = collect_custom_tool_names_from_payload(original_payload)
+        result, usage = _finalize_raw_response(decision, data, custom_names)
     else:
         upstream_codec = get_codec(decision.upstream_format)
         ir_response = upstream_codec.parse_response(data)
@@ -214,12 +223,17 @@ async def _handle_non_stream(
 def _finalize_raw_response(
     decision: RouteDecision,
     data: dict[str, Any],
+    custom_names: set[str] | None = None,
 ) -> tuple[dict[str, Any], IRUsage]:
     """responses→responses / messages→messages 的非流式透传收尾。"""
     if decision.upstream_format == 'messages':
         inject_thinking_into_messages_response(data)
         usage = parse_messages_usage(data.get('usage'))
     else:
+        # ApplyPatch 等 custom 工具：上游可能以 function_call 返回，
+        # 必须还原为 custom_tool_call，否则 Cursor 本地执行会报 Missing header。
+        if custom_names:
+            rewrite_responses_payload_for_custom_tools(data, custom_names)
         usage = parse_responses_usage(data.get('usage'))
 
     if data.get('model'):
@@ -269,7 +283,7 @@ async def _handle_stream(
         )
 
     if raw_response:
-        generator = _raw_stream(resp, decision, turn)
+        generator = _raw_stream(resp, decision, turn, original_payload)
     else:
         generator = _convert_stream(
             resp, decision, parse_format, ir_request, original_payload, turn,
@@ -365,15 +379,23 @@ async def _raw_stream(
     resp: httpx.Response,
     decision: RouteDecision,
     turn: dict[str, Any] | None,
+    original_payload: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     """responses→responses / messages→messages 的流式透传。
 
     保留上游全部事件结构（包括 IR 未建模的事件类型），只做：
     - 模型名改写（Cursor 侧展示映射前的模型名）
     - messages 链路的 reasoning_content → thinking block 注入
+    - responses 链路的 ApplyPatch/custom 工具 function_call → custom_tool_call 回写
     """
     is_messages = decision.upstream_format == 'messages'
     messages_filter = MessagesThinkingStreamFilter() if is_messages else None
+    custom_names = collect_custom_tool_names_from_payload(original_payload)
+    custom_rewriter = (
+        ResponsesCustomToolStreamRewriter(custom_names)
+        if (not is_messages and custom_names)
+        else None
+    )
 
     usage_input = 0
     usage_output = 0
@@ -432,10 +454,22 @@ async def _raw_stream(
                 if payload.get('model'):
                     payload['model'] = decision.client_model
 
-                message = sse_event(etype, payload) if etype else sse_data(payload)
-                client_count += 1
-                request_log.append_client_event(turn, {'raw': message})
-                yield message
+                # ApplyPatch/custom：function_call → custom_tool_call
+                events_out: list[tuple[str, dict[str, Any]]]
+                if custom_rewriter is not None:
+                    events_out = custom_rewriter.process(etype, payload)
+                else:
+                    events_out = [(etype, payload)]
+
+                for out_type, out_payload in events_out:
+                    message = (
+                        sse_event(out_type, out_payload)
+                        if out_type
+                        else sse_data(out_payload)
+                    )
+                    client_count += 1
+                    request_log.append_client_event(turn, {'raw': message})
+                    yield message
         except httpx.HTTPError as e:
             logger.error('读取上游流失败: %s', e)
             request_log.attach_error(turn, {'stage': 'stream_read', 'message': str(e)})

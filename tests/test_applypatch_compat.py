@@ -171,3 +171,102 @@ def test_chat_client_build_custom_tool_call():
 def test_repair_custom_tool_args():
     fixed = repair_custom_tool_args("ApplyPatch", {"diff": SAMPLE_PATCH})
     assert fixed["input"].startswith("*** Begin Patch")
+
+
+def test_raw_responses_stream_rewriter_function_to_custom():
+    from app.compat.tools import ResponsesCustomToolStreamRewriter
+
+    rewriter = ResponsesCustomToolStreamRewriter({'ApplyPatch'})
+    added = {
+        'type': 'response.output_item.added',
+        'output_index': 2,
+        'item': {
+            'id': 'fc_call_1',
+            'type': 'function_call',
+            'status': 'in_progress',
+            'call_id': 'call_1',
+            'name': 'ApplyPatch',
+            'arguments': '',
+        },
+        'sequence_number': 1,
+    }
+    out = rewriter.process('response.output_item.added', added)
+    assert len(out) == 1
+    assert out[0][0] == 'response.output_item.added'
+    assert out[0][1]['item']['type'] == 'custom_tool_call'
+    assert out[0][1]['item']['input'] == ''
+
+    # delta is buffered (JSON fragments not emitted as freeform)
+    delta = {
+        'type': 'response.function_call_arguments.delta',
+        'item_id': 'fc_call_1',
+        'output_index': 2,
+        'delta': '{"input":"' + SAMPLE_PATCH.replace('\n', '\\n') + '"}',
+        'sequence_number': 2,
+    }
+    assert rewriter.process('response.function_call_arguments.delta', delta) == []
+
+    done = {
+        'type': 'response.function_call_arguments.done',
+        'item_id': 'fc_call_1',
+        'output_index': 2,
+        'arguments': json.dumps({'input': SAMPLE_PATCH}),
+        'sequence_number': 3,
+    }
+    out = rewriter.process('response.function_call_arguments.done', done)
+    assert len(out) == 1
+    assert out[0][0] == 'response.custom_tool_call_input.done'
+    assert out[0][1]['input'].startswith('*** Begin Patch')
+    assert '{\"input\"' not in out[0][1]['input']
+
+    item_done = {
+        'type': 'response.output_item.done',
+        'output_index': 2,
+        'item': {
+            'id': 'fc_call_1',
+            'type': 'function_call',
+            'status': 'completed',
+            'call_id': 'call_1',
+            'name': 'ApplyPatch',
+            'arguments': json.dumps({'input': SAMPLE_PATCH}),
+        },
+        'sequence_number': 4,
+    }
+    out = rewriter.process('response.output_item.done', item_done)
+    assert out[0][1]['item']['type'] == 'custom_tool_call'
+    assert out[0][1]['item']['input'].startswith('*** Begin Patch')
+
+
+def test_rewrite_completed_payload_output_array():
+    from app.compat.tools import rewrite_responses_payload_for_custom_tools
+
+    payload = {
+        'type': 'response.completed',
+        'response': {
+            'id': 'resp_1',
+            'output': [
+                {
+                    'id': 'fc_1',
+                    'type': 'function_call',
+                    'status': 'completed',
+                    'call_id': 'call_1',
+                    'name': 'ApplyPatch',
+                    'arguments': json.dumps({'input': SAMPLE_PATCH}),
+                }
+            ],
+        },
+    }
+    rewrite_responses_payload_for_custom_tools(payload, {'ApplyPatch'})
+    item = payload['response']['output'][0]
+    assert item['type'] == 'custom_tool_call'
+    assert item['input'].startswith('*** Begin Patch')
+    assert 'arguments' not in item
+
+
+def test_collect_custom_names_from_payload():
+    from app.compat.tools import collect_custom_tool_names_from_payload
+
+    names = collect_custom_tool_names_from_payload({
+        'tools': [CUSTOM_TOOL, {'type': 'function', 'name': 'Shell', 'parameters': {'type': 'object', 'properties': {}}}]
+    })
+    assert names == {'ApplyPatch'}

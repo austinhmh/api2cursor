@@ -270,3 +270,62 @@ def test_collect_custom_names_from_payload():
         'tools': [CUSTOM_TOOL, {'type': 'function', 'name': 'Shell', 'parameters': {'type': 'object', 'properties': {}}}]
     })
     assert names == {'ApplyPatch'}
+
+
+def test_chat_stream_encoder_emits_type_custom_for_applypatch():
+    from app.core.ir import ToolCallStart, ToolCallDelta, ToolCallEnd, StreamEnd
+    from app.protocols.chat_completions import ChatStreamEncoder
+    import json as _json
+
+    enc = ChatStreamEncoder('gpt-5.2', custom_tool_names={'ApplyPatch'})
+    out = []
+    out += enc.encode(ToolCallStart(index=0, id='call_1', name='ApplyPatch', call_style='custom'))
+    # JSON shell deltas must be buffered
+    out += enc.encode(ToolCallDelta(index=0, arguments='{"input":' + _json.dumps(SAMPLE_PATCH)[0:10]))
+    out += enc.encode(ToolCallDelta(index=0, arguments=_json.dumps(SAMPLE_PATCH)[10:] + '}'))
+    out += enc.encode(ToolCallEnd(
+        index=0, id='call_1', name='ApplyPatch',
+        arguments=_json.dumps({'input': SAMPLE_PATCH}),
+        call_style='custom',
+    ))
+    out += enc.encode(StreamEnd(finish_reason='tool_calls'))
+
+    payloads = []
+    for chunk in out:
+        if not chunk.startswith('data: '):
+            continue
+        body = chunk[len('data: '):].strip()
+        if body == '[DONE]':
+            continue
+        payloads.append(_json.loads(body))
+
+    # find tool_calls
+    customs = []
+    for p in payloads:
+        delta = (p.get('choices') or [{}])[0].get('delta') or {}
+        for tc in delta.get('tool_calls') or []:
+            if tc.get('type') == 'custom' or 'custom' in tc:
+                customs.append(tc)
+    assert customs, f'no custom tool_calls in {payloads}'
+    # last custom should have freeform input
+    last = customs[-1]
+    assert last['type'] == 'custom'
+    assert last['custom']['name'] == 'ApplyPatch'
+    assert last['custom']['input'].startswith('*** Begin Patch')
+    assert not last['custom']['input'].lstrip().startswith('{')
+
+
+def test_chat_stream_encoder_detects_applypatch_by_name_without_custom_set():
+    from app.core.ir import ToolCallStart, ToolCallEnd
+    from app.protocols.chat_completions import ChatStreamEncoder
+    import json as _json
+
+    enc = ChatStreamEncoder('gpt-5.2')  # no explicit set
+    out = enc.encode(ToolCallStart(index=0, id='c1', name='ApplyPatch'))
+    out += enc.encode(ToolCallEnd(
+        index=0, id='c1', name='ApplyPatch',
+        arguments=_json.dumps({'input': SAMPLE_PATCH}),
+    ))
+    joined = ''.join(out)
+    assert '"type": "custom"' in joined or '"type":"custom"' in joined
+    assert '*** Begin Patch' in joined

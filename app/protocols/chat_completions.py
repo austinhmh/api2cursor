@@ -163,8 +163,13 @@ class ChatCompletionsCodec(Codec):
             'usage': build_cc_usage(response.usage),
         }
 
+    def set_custom_tool_names(self, names: set[str] | None) -> None:
+        """本轮 custom/ApplyPatch 工具名，供流式编码器回写 type=custom。"""
+        self._custom_tool_names = set(names or set())
+
     def stream_encoder(self, client_model: str) -> StreamEncoder:
-        return ChatStreamEncoder(client_model)
+        names = getattr(self, '_custom_tool_names', set())
+        return ChatStreamEncoder(client_model, custom_tool_names=names)
 
     # ═══════════════════════════════════════════
     #  上游方向
@@ -422,12 +427,22 @@ class ChatStreamDecoder(StreamDecoder):
 
 
 class ChatStreamEncoder(StreamEncoder):
-    def __init__(self, client_model: str):
+    def __init__(self, client_model: str, custom_tool_names: set[str] | None = None):
         self._model = client_model
         self._id = gen_id('chatcmpl-')
         self._created = int(time.time())
         self._role_sent = False
         self._done_sent = False
+        self._custom_tool_names = set(custom_tool_names or set())
+        # index → {call_style, name, id, args}
+        self._tools: dict[int, dict[str, Any]] = {}
+
+    def _is_custom(self, name: str, call_style: str = 'function') -> bool:
+        if call_style == 'custom':
+            return True
+        if name and (name in self._custom_tool_names or is_custom_origin_tool(name=name)):
+            return True
+        return False
 
     def encode(self, event: StreamEvent) -> list[str]:
         if isinstance(event, StreamStart):
@@ -439,6 +454,23 @@ class ChatStreamEncoder(StreamEncoder):
         if isinstance(event, ThinkingDelta):
             return self._ensure_role() + [self._chunk({'reasoning_content': event.text})]
         if isinstance(event, ToolCallStart):
+            call_style = getattr(event, 'call_style', 'function') or 'function'
+            if self._is_custom(event.name, call_style):
+                call_style = 'custom'
+            self._tools[event.index] = {
+                'id': event.id,
+                'name': event.name,
+                'call_style': call_style,
+                'args': '',
+            }
+            if call_style == 'custom':
+                # Cursor ApplyPatch 需要 type=custom + freeform input，不是 function JSON
+                return self._ensure_role() + [self._chunk({'tool_calls': [{
+                    'index': event.index,
+                    'id': event.id,
+                    'type': 'custom',
+                    'custom': {'name': event.name, 'input': ''},
+                }]})]
             return self._ensure_role() + [self._chunk({'tool_calls': [{
                 'index': event.index,
                 'id': event.id,
@@ -446,10 +478,44 @@ class ChatStreamEncoder(StreamEncoder):
                 'function': {'name': event.name, 'arguments': ''},
             }]})]
         if isinstance(event, ToolCallDelta):
+            tool = self._tools.get(event.index)
+            if tool is None:
+                # 未见到 start：按普通 function 增量透传
+                return [self._chunk({'tool_calls': [{
+                    'index': event.index,
+                    'function': {'arguments': event.arguments},
+                }]})]
+            tool['args'] = (tool.get('args') or '') + (event.arguments or '')
+            if tool.get('call_style') == 'custom':
+                # JSON 外壳增量无法可靠剥壳，缓冲到 ToolCallEnd
+                return []
             return [self._chunk({'tool_calls': [{
                 'index': event.index,
                 'function': {'arguments': event.arguments},
             }]})]
+        if isinstance(event, ToolCallEnd):
+            tool = self._tools.get(event.index)
+            name = event.name or (tool or {}).get('name') or ''
+            call_style = getattr(event, 'call_style', 'function') or 'function'
+            if self._is_custom(name, call_style):
+                call_style = 'custom'
+            args = event.arguments if event.arguments is not None else (tool or {}).get('args') or ''
+            call_id = event.id or (tool or {}).get('id') or gen_id('call_')
+            if tool is not None:
+                tool['name'] = name
+                tool['call_style'] = call_style
+                tool['args'] = args
+                tool['id'] = call_id
+            if call_style == 'custom':
+                freeform = extract_custom_input(args)
+                return [self._chunk({'tool_calls': [{
+                    'index': event.index,
+                    'id': call_id,
+                    'type': 'custom',
+                    'custom': {'name': name, 'input': freeform},
+                }]})]
+            # 普通 function：若 start 时已流过 arguments，这里不再重复
+            return []
         if isinstance(event, StreamEnd):
             return self._ensure_role() + [self._chunk(
                 {}, finish_reason=event.finish_reason, usage=event.usage,

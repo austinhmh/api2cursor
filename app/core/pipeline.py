@@ -200,11 +200,13 @@ async def _handle_non_stream(
         if decision.upstream_format == 'chat':
             extract_think_from_response(ir_response)
         custom_names = custom_tool_names(ir_request.tools) if ir_request else set()
+        if not custom_names:
+            custom_names = collect_custom_tool_names_from_payload(original_payload)
         for block in ir_response.tool_calls():
             fix_tool_call_block(block, custom_names)
-        # Responses 客户端需要知道哪些工具应回写为 custom_tool_call
+        # chat/responses 客户端都需要知道哪些工具应按 custom/ApplyPatch 回写
         client_codec = get_codec(decision.client_format)
-        if decision.client_format == 'responses' and hasattr(client_codec, 'set_custom_tool_names'):
+        if hasattr(client_codec, 'set_custom_tool_names'):
             client_codec.set_custom_tool_names(custom_names)
         result = client_codec.build_response(ir_response, decision.client_model)
         usage = ir_response.usage
@@ -303,7 +305,9 @@ async def _convert_stream(
     upstream_codec = get_codec(decision.upstream_format)
     client_codec = get_codec(decision.client_format)
     custom_names = custom_tool_names(ir_request.tools) if ir_request else set()
-    if decision.client_format == 'responses' and hasattr(client_codec, 'set_custom_tool_names'):
+    if not custom_names:
+        custom_names = collect_custom_tool_names_from_payload(original_payload)
+    if hasattr(client_codec, 'set_custom_tool_names'):
         client_codec.set_custom_tool_names(custom_names)
     decoder = upstream_codec.stream_decoder()
     encoder = client_codec.stream_encoder(decision.client_model)

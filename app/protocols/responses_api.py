@@ -302,7 +302,8 @@ class ResponsesStreamDecoder(StreamDecoder):
             call_id = item.get('call_id') or item.get('id') or gen_id('call_')
             name = item.get('name', '')
             initial_args = item.get('arguments', '') or ''
-            call_style = 'function'
+            # 上游可能把 ApplyPatch 降级为 function_call；按名称回升 custom
+            call_style = 'custom' if is_custom_origin_tool(name=name) else 'function'
 
         self._tools[output_index] = {
             'index': our_index,

@@ -369,6 +369,7 @@ def extract_freeform_input(arguments: Any) -> str:
       - 纯字符串 patch 正文
       - {"input": "..."}
       - {"patch": "..."} / {"patchText": "..."} / {"patch_text": "..."}
+      - 含真实换行的伪 JSON（流式拼接常见，标准 json.loads 会失败）
       - 其它 JSON 对象：优先取第一个字符串字段，否则 dump 整对象
     """
     if arguments is None:
@@ -377,14 +378,15 @@ def extract_freeform_input(arguments: Any) -> str:
         for key in ('input', 'patch', 'patchText', 'patch_text', 'content', 'text'):
             value = arguments.get(key)
             if isinstance(value, str) and value:
-                return value
+                # 可能再次包了一层 JSON 字符串
+                return extract_freeform_input(value) if value.lstrip().startswith('{') else value
             if value is not None and not isinstance(value, (dict, list)):
                 return str(value)
         # 单字段对象
         if len(arguments) == 1:
             only = next(iter(arguments.values()))
             if isinstance(only, str):
-                return only
+                return extract_freeform_input(only) if only.lstrip().startswith('{') else only
         try:
             return json.dumps(arguments, ensure_ascii=False)
         except (TypeError, ValueError):
@@ -397,15 +399,79 @@ def extract_freeform_input(arguments: Any) -> str:
     stripped = text.strip()
     if not stripped:
         return ''
-    # 尝试 JSON 解包 {"input":"..."}
+
+    # 优先 JSON 解包。注意：含 patch 标记的 {"input":"..."} 也会命中 _looks_like_patch，
+    # 必须先解包，否则会把外壳原样返回给 Cursor 导致 Missing header。
     if stripped[0] in '{[':
         try:
             parsed = json.loads(stripped)
         except (json.JSONDecodeError, ValueError):
-            return text
+            recovered = _extract_freeform_from_broken_json(stripped)
+            return recovered if recovered is not None else text
         return extract_freeform_input(parsed)
+
+    # 已经是 patch 正文 / 其它 freeform
+    if stripped.startswith('*** Begin Patch') or _looks_like_patch(stripped):
+        return text
     return text
 
+
+def _extract_freeform_from_broken_json(text: str) -> str | None:
+    """从含未转义换行的伪 JSON 中提取 input/patch 字段。"""
+    for key in ('input', 'patch', 'patchText', 'patch_text', 'content', 'text'):
+        key_pat = f'"{key}"'
+        idx = text.find(key_pat)
+        if idx < 0:
+            continue
+        colon = text.find(':', idx + len(key_pat))
+        if colon < 0:
+            continue
+        i = colon + 1
+        while i < len(text) and text[i] in ' \t\r\n':
+            i += 1
+        if i >= len(text) or text[i] != '"':
+            continue
+        i += 1  # skip opening quote
+        out: list[str] = []
+        while i < len(text):
+            ch = text[i]
+            if ch == '\\' and i + 1 < len(text):
+                out.append(ch)
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                raw = ''.join(out)
+                # raw 可能是合法 JSON 字符串内容（含 \\n 转义），也可能含真实换行
+                try:
+                    return json.loads('"' + raw + '"')
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                result: list[str] = []
+                j = 0
+                while j < len(raw):
+                    if raw[j] == '\\' and j + 1 < len(raw):
+                        nxt = raw[j + 1]
+                        if nxt == 'n':
+                            result.append('\n')
+                        elif nxt == 't':
+                            result.append('\t')
+                        elif nxt == 'r':
+                            result.append('\r')
+                        elif nxt == '"':
+                            result.append('"')
+                        elif nxt == '\\':
+                            result.append('\\')
+                        else:
+                            result.append(nxt)
+                        j += 2
+                    else:
+                        result.append(raw[j])
+                        j += 1
+                return ''.join(result)
+            out.append(ch)
+            i += 1
+    return None
 
 def unwrap_custom_tool_input(arguments: str) -> str:
     """从 {"input":"..."} 参数中取出 freeform 正文，供 custom_tool_call 回写。"""

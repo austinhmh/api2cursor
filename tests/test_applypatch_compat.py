@@ -329,3 +329,53 @@ def test_chat_stream_encoder_detects_applypatch_by_name_without_custom_set():
     joined = ''.join(out)
     assert '"type": "custom"' in joined or '"type":"custom"' in joined
     assert '*** Begin Patch' in joined
+
+
+
+def test_extract_freeform_broken_json_with_newlines():
+    """流式拼接产生的真实换行伪 JSON 必须解出 patch 正文。"""
+    from app.compat.tools import extract_freeform_input, ResponsesCustomToolStreamRewriter
+
+    valid = '{"input":"*** Begin Patch\\n*** Add File: /tmp/x.txt\\n+hi\\n*** End Patch\\n"}'
+    out = extract_freeform_input(valid)
+    assert out.startswith('*** Begin Patch'), out
+
+    broken2 = (
+        '{"input":"*** Begin Patch\n'
+        '*** Add File: /tmp/x.txt\n'
+        '+hi\n'
+        '*** End Patch\n"}'
+    )
+    out2 = extract_freeform_input(broken2)
+    assert out2.startswith('*** Begin Patch'), repr(out2)
+    assert '*** Add File:' in out2
+    assert not out2.lstrip().startswith('{'), repr(out2)
+
+    rewriter = ResponsesCustomToolStreamRewriter({'ApplyPatch'})
+    events = []
+    events += rewriter.process('response.output_item.added', {
+        'type': 'response.output_item.added', 'output_index': 0,
+        'item': {
+            'id': 'fc_1', 'type': 'function_call', 'status': 'in_progress',
+            'call_id': 'call_1', 'name': 'ApplyPatch', 'arguments': '',
+        },
+    })
+    events += rewriter.process('response.function_call_arguments.done', {
+        'type': 'response.function_call_arguments.done',
+        'item_id': 'fc_1', 'output_index': 0,
+        'arguments': broken2,
+    })
+    events += rewriter.process('response.output_item.done', {
+        'type': 'response.output_item.done', 'output_index': 0,
+        'item': {
+            'id': 'fc_1', 'type': 'function_call', 'status': 'completed',
+            'call_id': 'call_1', 'name': 'ApplyPatch', 'arguments': broken2,
+        },
+    })
+    types = [et for et, _ in events]
+    assert 'response.custom_tool_call_input.done' in types
+    done = next(pl for et, pl in events if et == 'response.custom_tool_call_input.done')
+    assert done['input'].startswith('*** Begin Patch'), repr(done['input'])
+    item_done = next(pl for et, pl in events if et == 'response.output_item.done')
+    assert item_done['item']['type'] == 'custom_tool_call'
+    assert item_done['item']['input'].startswith('*** Begin Patch')
